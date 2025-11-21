@@ -1,0 +1,2414 @@
+ShyPal — Class Diagrams (Architecture-level)
+This document contains architecture-level class diagrams and explanations for ShyPal’s core subsystems: Discovery, Handshake & Session, Messaging, Persistence, Save/Token, Safety, and Backend interaction. Use these as blueprints for implementation in Swift (iOS) and Kotlin (Android).
+
+1. Overview (UML-style)
++----------------------+      +----------------------+      +----------------------+
+|    DiscoveryManager  |<>----|   EphemeralBeacon    |<>----|   EphemeralIdRotator |
++----------------------+      +----------------------+      +----------------------+
+| - bleScanner         |      | - id: String         |      | - rotationInterval   |
+| - bleAdvertiser      |      | - ts: DateTime       |      | - currentId          |
+| - wifiAwareHandler   |      | - capabilities       |      | - rotate()           |
+| - mpcHandler         |      | - signalStrength    |      +----------------------+
+| +startScan()         |      | +payload()           |
+| +stopScan()          |      +----------------------+
++----------------------+
+         |                         /
+         | discovers             /  broadcasts
+         v                     v
++----------------------+      +----------------------+
+|   DeviceBubble       |      |   DiscoveryAdapter   |
++----------------------+      +----------------------+
+| - ephemeralId        |      | - platform: enum     |
+| - lastSeen           |      | - capabilities       |
+| - rssi               |      | +sendIntroRequest()  |
+| +distanceEstimate()  |      +----------------------+
++----------------------+      
+
+2. Handshake & Session (UML)
++-----------------------+      +----------------------+      +---------------------+
+|   HandshakeManager    |<>----|   KeyExchange        |<>----|   SessionManager    |
++-----------------------+      +----------------------+      +---------------------+
+| - pendingRequests     |      | - localPreKey        |      | - sessions: Map     |
+| - timeouts            |      | - remotePreKey       |      | - createSession()   |
+| +initiateHandshake()  |      | +performECDH()       |      | - closeSession()    |
+| +onHandshakeReply()   |      +----------------------+      | - sendEncrypted()   |
++-----------------------+                                     | - recvEncrypted()   |
+                                                                +---------------------+
+                                                                
++---------------------+
+|   Session           |
++---------------------+
+| - sessionId         |
+| - sessionKey        |
+| - ratchetState      |
+| - lastActive        |
+| +encrypt(msg)      |
+| +decrypt(blob)     |
++---------------------+
+Notes: - KeyExchange implements X25519/ECDH and can interoperate with a libsignal-style pre-key approach. - SessionManager manages per-peer Double-Ratchet state if using libsignal, or AES-GCM session keys for a simpler approach.
+
+3. Messaging & Transport (UML)
++----------------------+     +----------------------+     +---------------------+
+|   MessageComposer    |---->|   TransportAdapter   |---->|   BLETransport      |
++----------------------+     +----------------------+     +---------------------+
+| - compose(text)      |     | - send(payload)      |     | - writeGattChar()   |
+| - attachMeta()       |     | - receive()          |     | - onWriteAck()      |
++----------------------+     +----------------------+     +---------------------+
+                                           |               +---------------------+
+                                           |               |  WiFiDirectTransport|
+                                           |               | - createSocket()    |
+                                           v               | - send()/recv()     |
+                                      +----------------------+ +---------------------+
+                                      |  NearbyTransport     |
+                                      +----------------------+
+                                      | - platformRouting()  |
+                                      +----------------------+
+Notes: - TransportAdapter is an abstraction routing encrypted payloads to the best available medium (BLE / Wi-Fi Direct / Multipeer / Nearby Connections). - MessageComposer handles chunking and ACKs for BLE limitations.
+
+4. Persistence & Local Models (UML)
++----------------------+    +----------------------+    +--------------------+
+|   EphemeralStore     |<>--|   ChatSessionEntity  |<>--|   MessageEntity    |
++----------------------+    +----------------------+    +--------------------+
+| - sessions: Map      |    | - sessionId          |    | - messageId        |
+| - save(friendToken)  |    | - isSaved: Bool      |    | - senderTag        |
+| - purgeExpired()     |    | - createdAt          |    | - ciphertext       |
++----------------------+    +----------------------+    +--------------------+
+
++--------------------+
+|   FriendTokenEntity|
++--------------------+
+| - tokenId          |
+| - peerPubKey       |
+| - nickname         |
+| - createdAt        |
++--------------------+
+Notes: - EphemeralStore is an encrypted local DB (SQLCipher/EncryptedRealm). Default TTL for ChatSessionEntity is 5 minutes idle. - FriendTokenEntity stored only when mutual consent is given.
+
+5. Safety / Moderation (UML)
++----------------------+    +----------------------+    +--------------------+
+|   AbuseManager       |<>--|   BlockList          |<>--|   ReportQueue      |
++----------------------+    +----------------------+    +--------------------+
+| - blockedIds: Set    |    | - idHash             |    | - enqueueReport()  |
+| - rateLimiter        |    | - blockedAt          |    | - sendToServer()   |
+| - onUnsolicitedMsg() |    | +isBlocked(id)       |    | - retryPolicy()    |
++----------------------+    +----------------------+    +--------------------+
+Notes: - BlockList & AbuseManager keep local hashed IDs. Reports optionally send salted hashed data to backend for aggregate abuse mitigation.
+
+6. Backend Interaction (UML)
++----------------------+    +----------------------+    +--------------------+
+|   SyncManager        |----|   ApiClient          |----|   FriendService    |
++----------------------+    +----------------------+    +--------------------+
+| - syncTokens()       |    | - post()             |    | - createToken()    |
+| - pushRegistration() |    | - get()              |    | - claimToken()     |
+| - fetchUpdates()     |    +----------------------+    +--------------------+
+
++--------------------+
+|   PushService      |
++--------------------+
+| - registerAPN()    |
+| - registerFCM()    |
+| - sendPushStub()   |
++--------------------+
+Backend DB (simplified tables): - friend_tokens(token_id, owner_pubkey, encrypted_profile_blob, created_at) - push_tokens(device_id, platform, push_token, created_at) - reports(id_hash, reporter_hash, timestamp, metadata)
+
+7. Component Responsibilities (summary)
+DiscoveryManager: orchestrates platform discovery adapters and exposes “NearbyDevice” events.
+HandshakeManager: initiates and validates key exchange; enforces one unsolicited message policy.
+SessionManager: maintains live crypto session and ratchet state; rotates session keys as needed.
+TransportAdapter: abstracts BLE / Wi-Fi / Multipeer transports and manages chunking/reassembly.
+EphemeralStore: encrypted DB with TTL purging and friend token storage.
+AbuseManager: local blocking, rate limiting, reporting queue to backend.
+SyncManager / ApiClient: opt-in cloud interactions for friend token syncing, push registration, and abuse analytics.
+
+8. Implementation Mapping (classes → platform)
+iOS (Swift)
+DiscoveryManager -> uses MultipeerConnectivity, CoreBluetooth wrappers
+HandshakeManager -> SwiftCrypto (Curve25519) + optional Signal bindings
+EphemeralStore -> SQLCipher / Realm with Keychain-stored encryption keys
+Android (Kotlin)
+DiscoveryManager -> BluetoothLeScanner / Nearby / WifiAwareManager
+HandshakeManager -> BouncyCastle / Tink / libsodium wrapper
+EphemeralStore -> EncryptedRoom (SQLCipher) or EncryptedRealm
+
+9. Next steps (for engineers)
+Convert these UML classes to real code modules (one package per module). Use interfaces for TransportAdapter and DiscoveryAdapter.
+Implement Crypto primitives with test vectors and unit tests for every handshake path.
+Implement DB schema and purge policies; add migration plan.
+Create integration tests across multiple Android/iOS devices to validate discovery & handshake.
+
+If you want, I can now: - Produce Mermaid or PlantUML diagrams for visual export - Generate Type/Class skeletons in Kotlin and Swift for the main modules - Make sequence diagrams for discovery → handshake → message → save flows
+Tell me which next.
+
+
+
+Below is a deep, end-to-end master summary of ShyPal — what it is, how it works, why it’s unique, the entire offline/online architecture, backend logic, UX flows, security model, and finally a Cursor AI project objective you can paste directly to make it build the entire app from scratch.
+
+✅ SHYPAL — COMPLETE SYSTEM SUMMARY (A–Z)
+Offline proximity messaging for introverts.
+
+🔵 1. WHAT IS SHYPAL? (Core Idea)
+ShyPal is an offline, anonymous proximity messaging app that lets you text people nearby without internet, without phone numbers, and without revealing your identity.
+You simply:
+Open the app
+
+
+Discover people nearby via Bluetooth / Wi-Fi Direct / Multipeer Connectivity
+
+
+Send a message anonymously
+
+
+If the conversation lasts long enough, ShyPal prompts:
+ “Do you want to keep this connection?”
+
+
+If both users confirm, a mutual friend token is exchanged, enabling online chat later (when internet is available).
+
+
+It is the first introvert-focused proximity social app optimized for shy people who can’t say “hi” in person.
+
+🟢 2. WHAT MAKES SHYPAL SPECIAL vs WhatsApp / FB / Snapchat?
+ShyPal is fundamentally opposite of messaging apps:
+Feature
+WhatsApp / Messenger
+ShyPal
+Requires phone number
+Yes
+❌ No phone number ever
+Requires internet
+Yes
+❌ Offline first
+Identity needed
+Yes
+❌ Anonymous
+Shows real name
+Yes
+❌ Random rotating ID
+Designed for existing friends
+Yes
+❌ For strangers near you
+Proximity-based
+No
+✔ Yes
+Auto-delete
+Not really
+✔ Full ephemerality
+No confrontational social pressure
+❌
+✔ Specifically for shy users
+
+ShyPal = Whisper + AirDrop + Anonymous Chat + Safety + Introvert UX.
+
+🟣 3. FEATURE SUMMARY
+Core Offline Features
+Anonymous profile (emoji + color code)
+
+
+Rotating Ephemeral IDs (BLE advertisement changes every 90s)
+
+
+Offline discovery (BLE / Wi-Fi Direct / iOS Multipeer Connectivity)
+
+
+Encrypted P2P messaging (AES-256 + ECDH)
+
+
+Ephemeral chat sessions (auto-delete)
+
+
+Local-only storage (no cloud until friendship saved)
+
+
+Safety system:
+
+
+10-minute session timeout
+
+
+Anti-stalking rotating IDs
+
+
+No GPS stored
+
+
+
+Friendship / Long Chat Features
+If chat exceeds X minutes or Y messages → pop-up:
+ “Looks like you clicked. Save each other?”
+
+
+If both tap YES → offline key exchange creates:
+
+
+Mutual friend secret (ECDH)
+
+
+Saved identity (nickname the user assigns)
+
+
+After that:
+
+
+They can message online (through minimal backend)
+
+
+Backend cannot read messages (E2EE like Signal)
+
+
+Can push notifications
+
+
+
+Optional Online Features (Backend)
+Friend tokens (like Signal’s “prekeys”)
+
+
+Push message relay
+
+
+Abuse reporting (hash-based, anonymous)
+
+
+No phone number or email login
+
+
+Instead: device-bound cryptographic identity
+
+
+
+🔵 4. FULL ARCHITECTURE (2025 Standard)
+4.1 Device Layer
+iOS
+MultipeerConnectivity for discovery + transport
+
+
+BLE advertising fallback
+
+
+NEARBY SERVICE key exchange
+
+
+Background modes supported for limited time (MCNearbyPeerReconnect)
+
+
+Android
+Bluetooth LE Advertising + Scanning
+
+
+Wi-Fi Direct for high-bandwidth message transport
+
+
+Nearby Connections API (fallback)
+
+
+Cross-platform logic
+Ephemeral Rotating ID pack:
+
+ {
+  ephemeralPublicKey,
+  salt,
+  capabilitiesHash,
+  version
+}
+
+
+
+4.2 Cryptography
+Offline Session
+Each device generates:
+
+
+Curve25519 long-term device identity (not shared publicly)
+
+
+Rotating ephemeral Curve25519 keys for proximity handshake
+
+
+Session creation
+A scans B’s broadcast
+
+
+A sends “hello packet” encrypted with ephemeral keys
+
+
+B replies and establishes shared secret
+
+
+Both derive session key:
+
+ SessionKey = HKDF(ECDH(ephemeralA, ephemeralB) + salt)
+
+
+Online friendship
+When both save each other:
+
+
+Devices exchange a permanent Friend Key Pair (Curve25519)
+
+
+Stored locally and registered to backend for message routing
+
+
+
+4.3 Backend (Optional)
+You need a backend only for online “saved friends” messaging.
+Backend components:
+Gateway API (FastAPI / Node.js)
+
+
+Message Queue (Kafka / NATS / Redis Stream)
+
+
+Key Distribution System (like Signal Prekeys)
+
+
+Push Notification service
+
+
+Encrypted blob store
+
+
+Data stored:
+User public identity key
+
+
+Friend prekeys
+
+
+Routing table (hashed user ID → device push token)
+
+
+No messages stored, no metadata beyond routing.
+
+4.4 App Architecture (Mobile)
+iOS (Swift 6 / Combine / Swift Concurrency)
+Layered Architecture
+
+
+CoreCrypto
+
+
+NearbyKit (discovery + transport)
+
+
+ChatEngine
+
+
+UI (SwiftUI)
+
+
+Android (Kotlin / Jetpack Compose)
+Module Separation
+
+
+cryptography
+
+
+discovery
+
+
+transport
+
+
+chat engine
+
+
+datastore + Room
+
+
+UI Compose screens
+
+
+Both platforms share protocol spec and message formats.
+
+🔵 5. UX FLOW (Designed for Shy People)
+1️⃣ OPEN APP
+No login, no phone number
+
+
+You’re assigned an emoji + color
+
+
+You see “People around you (3)”
+
+
+2️⃣ TAP SOMEONE
+Chat opens
+
+
+Username: “🌙 Blue Fox #29F”
+
+
+Vibes-friendly UI (soft colors)
+
+
+3️⃣ CHAT (Offline)
+Messages appear instantly
+
+
+Timer shows “You’ve been chatting for 7 minutes…”
+
+
+4️⃣ CONNECTION PROMPT
+“Nice chat! Want to keep each other?”
+ Both must accept.
+5️⃣ IF CONFIRMED
+Friend token created
+
+
+Next time you both are online → cloud handshake
+
+
+Now you can chat anytime via encrypted online messages
+
+
+
+🟢 6. SAFETY SYSTEM
+Rotating IDs (prevents tracking)
+
+
+Local-only storage
+
+
+Auto-delete all messages after 5 minutes of inactivity
+
+
+Block and burn session key
+
+
+No GPS stored
+
+
+Optional “Ghost Mode” (do not be discoverable)
+
+
+
+🔵 7. BUSINESS AND VIRALITY STRATEGY
+ShyPal succeeds because:
+1. It’s an “icebreaker for introverts”
+No competitor targets this psychology.
+2. Offline works everywhere
+Clubs, malls, coffee shops, universities, events.
+3. Fun + mysterious
+Emoji + color identity makes it playful like early internet chatrooms.
+4. Ultra-privacy-first
+Perfect for communities concerned about data collection.
+5. Niche → global expansion
+Start with introverts → expand to:
+events
+
+
+conferences
+
+
+airports
+
+
+coworking
+
+
+universities
+
+
+
+🟣 8. CURSOR AI — FULL OBJECTIVE TO BUILD THE ENTIRE SHYPAL APP
+Paste the following directly into Cursor:
+
+CURSOR OBJECTIVE — BUILD SHYPAL (FULL APP)
+Project Goal:
+ Build ShyPal, a cross-platform (iOS + Android) offline-first proximity messaging app using Swift (iOS), Kotlin (Android), with an optional backend for online messaging.
+
+✔ SYSTEM REQUIREMENTS
+1. Offline Discovery
+Implement discovery layer:
+iOS: MultipeerConnectivity (primary), BLE advertising fallback
+
+
+Android: BLE Advertising + Scanning, Wi-Fi Direct
+
+
+Cross-platform protocol for:
+
+
+ephemeral rotating IDs every 90 seconds
+
+
+ephemeral public key broadcast
+
+
+service capability advertisement
+
+
+
+2. Cryptography
+Implement Curve25519 key exchange
+
+
+HKDF session key derivation
+
+
+AES-256-GCM message encryption
+
+
+Rotating ephemeral identity system
+
+
+Friend key system for online communication (Signal-style prekeys)
+
+
+
+3. Offline P2P Messaging Engine
+Real-time encrypted messaging
+
+
+Delivery receipts
+
+
+Session lifetime: 10 minutes max
+
+
+Auto-delete messages after 5 minutes idle
+
+
+
+4. Friend Save System (“Mutual Consent”)
+Track chat duration + message count
+
+
+When threshold met → show “Save Connection” prompt
+
+
+Mutual confirmation exchange creates:
+
+
+Permanent friend key pair
+
+
+Local friend record
+
+
+Sync friend prekeys to backend
+
+
+
+5. Online Messaging (Backend)
+Backend stack:
+FastAPI or Node.js
+
+
+Redis Stream or NATS queue for routing
+
+
+Postgres for identities
+
+
+Firebase APNs + FCM for push
+
+
+No message storage (pass-through only)
+
+
+End-to-end encryption
+
+
+Endpoints:
+register device + public identity key
+
+
+upload friend prekeys
+
+
+push message envelope
+
+
+deliver message to target push token
+
+
+
+6. Mobile App Architecture
+iOS:
+Swift 6
+
+
+Swift Concurrency
+
+
+Combine
+
+
+SwiftUI
+
+
+Modules:
+
+
+CoreCrypto
+
+
+DiscoveryKit
+
+
+NearbyTransport
+
+
+ChatEngine
+
+
+UI
+
+
+Android:
+Kotlin
+
+
+Jetpack Compose
+
+
+Coroutines + Flow
+
+
+Modules:
+
+
+crypto
+
+
+discovery
+
+
+transport
+
+
+chat
+
+
+data
+
+
+ui
+
+
+
+7. UI/UX
+Implement UX for:
+discovery list
+
+
+chat screen
+
+
+save connection prompt
+
+
+friend list
+
+
+chat-after-saving (online)
+
+
+settings (ghost mode, block)
+
+
+Style:
+soft pastel colors
+
+
+emoji identity
+
+
+introvert-friendly calm UI
+
+
+minimal, quiet animations
+
+
+
+✔ DELIVERABLES
+Cursor should generate:
+Full iOS project
+
+
+Full Android project
+
+
+Shared protocol documentation
+
+
+Backend service (FastAPI/Node.js)
+
+
+Infra (Docker Compose, Redis, Postgres)
+
+
+Detailed READMEs
+
+
+End-to-end tests
+
+
+Security model documentation
+
+
+
+If you want, I can now generate:
+🔧 Protocol Specification (RFC-style)
+
+
+📱 Screen-by-screen UI guide
+
+
+🧩 API contract definitions
+
+
+🏗 Backend folder structure
+
+
+🛡 Threat model & safety engineering doc
+
+
+📦 Full GitHub repository structure
+
+
+Just tell me:
+ “Continue with the Protocol Spec” or
+ “Generate full project folder structure” or
+ “Start building the backend APIs.”
+Nice — below is everything you asked for, delivered in one complete package right now:
+a protocol specification (RFC-style)
+
+
+screen-by-screen UI guide & microcopy
+
+
+API contract definitions (OpenAPI-like endpoints + JSON shapes)
+
+
+backend folder / infra structure (docker-compose-ready)
+
+
+threat model & mitigation plan (practical, prioritized)
+
+
+recommended GitHub repo layout for iOS, Android, backend, infra, docs, and CI
+
+
+I kept it pragmatic and implementation-ready for engineers in 2025. You can hand this to devs/AI assistants (Cursor, GitHub Copilot, etc.) to start building.
+1 — Protocol Specification (RFC-style) — ShyPal P2P & Cloud Protocol
+Version: 1.0 • Date: 2025-11-20
+1.1 Goals & assumptions
+Primary: enable offline encrypted chat between nearby devices; mutual save creates online friend tokens.
+
+
+Devices: iOS & Android.
+
+
+Discovery mediums: BLE Advertising/Scan, Multipeer (iOS), Wi-Fi Aware / Nearby (Android).
+
+
+Threat model: untrusted opportunistic environment (public spaces). Use E2EE and ephemeral IDs.
+
+
+1.2 Identifiers
+DeviceLongId — Curve25519 public key (long-term, kept private; stored in Secure Enclave / Android Keystore). Not broadcast.
+
+
+EphemeralBeaconId (EID) — random 32/64-byte value derived from ephemeral Curve25519 public key; rotates every ROTATE_INTERVAL (default 60s). Format: base64url(ECDH_pub || timestamp || capabilities_hash) signed or HMACed by ephemeral private key.
+
+
+SessionId — UUIDv4 generated when handshake succeeds.
+
+
+FriendToken — 256-bit random token (base64url) generated upon mutual save; stored locally and optionally registered on backend (encrypted metadata only).
+
+
+1.3 Crypto primitives
+Key agreement: X25519 (Curve25519 ECDH).
+
+
+KDF: HKDF-SHA256 with context string "ShyPal v1 session".
+
+
+Symmetric encryption: AES-256-GCM for payloads.
+
+
+Optional advanced: Signal Protocol (X3DH + Double Ratchet) for full forward secrecy and post-compromise recovery (recommended for Phase 2).
+
+
+Nonce strategy: 96-bit random nonce per message; include nonce in envelope.
+
+
+Message MAC: AES-GCM provides integrity.
+
+
+1.4 Packet formats (over transport adapters)
+All packet bytes are binary with small TLV-like framing. For readability show JSON-like structures; final implementation must be binary/CBOR.
+1.4.1 Beacon (BLE advertisement payload)
+Small payload (<= 31 bytes adv data). Packed fields:
+EID_prefix (8 bytes) | version (1 byte) | cap_flags (1 byte) | truncated_ts (4 bytes)
+
+Full ephemeral data retrieved via GATT or Multipeer service discovery when establishing handshake.
+1.4.2 IntroRequest (sent when sender taps Send)
+{
+  type: "intro_req",
+  sender_eph_pub: base64url,
+  sender_nonce: base64url, // for handshake
+  sender_caps: [ "txt" ],
+  proto_version: 1
+}
+
+1.4.3 IntroReply (recipient)
+{
+  type: "intro_reply",
+  recipient_eph_pub: base64url,
+  accept: bool, // if unsolicited allowed = true only for first message
+  server_chosen_transport: "BLE" | "WIFI" | "MULTIPEER"
+}
+
+1.4.4 EncryptedMessage envelope
+Binary envelope:
+{
+  type: "enc_msg",
+  session_id: UUID,
+  iv: base64url,
+  ciphertext: base64url, // AES-GCM
+  seq: uint32, // for ordering
+  meta: { display_hint: "one_line" } // optional
+}
+
+1.4.5 SaveOffer / SaveConfirm (mutual save)
+SaveOffer {
+  type: "save_offer",
+  session_id: UUID,
+  offerer_pub_friend_key: base64url, // new friend pubkey
+  optional_profile_blob: base64url // user-chosen emoji, nickname (encrypted to friend key)
+}
+SaveConfirm {
+  type: "save_confirm",
+  session_id: UUID,
+  confirmer_pub_friend_key: base64url
+}
+
+Upon mutual confirm: both parties compute FriendToken = HMAC_SHA256(shared_friend_key, "ShyPalFriendToken") and optionally register public friend prekeys with backend.
+1.5 Session lifecycle
+Discovery: devices detect EID beacon.
+
+
+IntroRequest sent (one unsolicited allowed -> recipient sees preview).
+
+
+If recipient accepts, exchange ephemeral pubs -> derive session key via X25519: sk = HKDF(X25519(sender_eph_priv, recipient_eph_pub) || X25519(sender_long_priv, recipient_eph_pub) || ...). (Use multiple DHs for extra security).
+
+
+Establish session: assign SessionId.
+
+
+Exchange messages encrypted with session key.
+
+
+Track lastActive; if idle > AUTO_DELETE = 5 minutes → delete session keys & payloads.
+
+
+If SaveOffer occurs and is confirmed → create FriendToken and optional cloud registration.
+
+
+1.6 Transport & chunking
+BLE GATT: chunk ciphertext to 180-byte payloads, reassemble. Provide ACK/resend.
+
+
+Wi-Fi Direct / Nearby: send full envelope in one payload.
+
+
+Multipeer: use MCSession data.
+
+
+1.7 Time & clocking
+Use monotonic timers for session TTL. Timestamps only used for debugging and rotate determinism; do not rely on device clock for security.
+
+
+
+2 — Screen-by-screen UI Guide & Microcopy (exact copy devs can paste)
+Design language: calm, pastel, rounded. Minimal animations. Prioritize onboarding clarity and safety.
+2.1 Onboarding (3 screens)
+Screen A: Welcome
+Title: “Say hi — the shy way.”
+
+
+Subtitle: “Anonymous. Offline. Private.”
+
+
+CTA: Get Started
+
+
+Screen B: Permissions
+Header: “We need a couple of permissions”
+
+
+Bullets:
+
+
+“Bluetooth — to discover nearby people.”
+
+
+“Local network (iOS) — for peer connections.”
+
+
+“Notifications — optional (for saved friends).”
+
+
+Buttons: Allow Bluetooth (system prompt), Skip Notifications
+
+
+Screen C: Quick Privacy
+Text: “No phone numbers. No accounts required. Messages auto-delete after 5 minutes.”
+
+
+CTA: Start
+
+
+2.2 Home / Discover
+Top: status bar: Discovering… with toggle (visible / ghost mode)
+
+
+List of bubbles:
+
+
+Each bubble shows: distance (Near / Mid / Far), vibe emoji (if user chose to expose), time last seen.
+
+
+Microcopy on empty state: “No one nearby — try moving to a busier spot or open ShyPal again.”
+
+
+2.3 Bubble Tap → Pre-chat modal
+Title: “Say Hi”
+
+
+Subtitle: “You can send one quick message — they’ll decide if they want to reply.”
+
+
+Text input (single line) with suggested quick messages dropdown:
+
+
+“Hey, I noticed your jacket — cool choice!”
+
+
+“Hi — wanted to say hello :)”
+
+
+“Coffee later? ☕️”
+
+
+Buttons: Send, Cancel
+
+
+2.4 Incoming unsolicited popup
+Title: “Someone nearby wants to say hi”
+
+
+Preview: First 120 chars of message (honor recipient setting to hide preview)
+
+
+CTA: View / Ignore
+
+
+Microcopy: “Accepting establishes a secure session — messages delete automatically.”
+
+
+2.5 Chat screen
+Top: session header: “Nearby • 3m” with timer: “Auto-delete in 04:22”
+
+
+Messages: bubbles with small lock icon (E2EE)
+
+
+Input: text field + send
+
+
+Secondary buttons: Save (greyed until threshold), Block, Report
+
+
+2.6 Save prompt (after thresholds)
+Center modal:
+
+
+Title: “Looks like you clicked”
+
+
+Body: “Save each other so you can chat later when you’re online?”
+
+
+Buttons: Save / Not now
+
+
+If Save tapped by both: show confetti micro-animation and Saved! with text: “You can now chat when one of you is online.”
+
+
+2.7 Saved Friends list
+Each friend row: emoji avatar, nickname (if given), last online (if online mode used)
+
+
+Tap opens online encrypted chat
+
+
+Options: Unfriend, Rename, Delete
+
+
+2.8 Settings (simple)
+Ghost Mode toggle (invisible)
+
+
+Auto-delete timer (default 5 min) slider
+
+
+Privacy: “How ShyPal protects you” modal (link to longer policy)
+
+
+Report history
+
+
+
+3 — API Contract Definitions (OpenAPI-like summaries)
+Backend is optional. Provide minimal endpoints for friend token sync, push registration, and abuse reports. All server-side operations accept/return JSON. All sensitive payloads are ciphertext (clients encrypt). Use TLS + JWT for device auth.
+Base URL: https://api.shypal.app/v1
+3.1 Auth & device registration
+POST /devices/register
+Registers device for push and publishes public identity key.
+ Request:
+{
+  "device_id": "uuid",
+  "platform": "ios"|"android",
+  "pub_key": "base64url", // device long-term public key
+  "prekeys": ["base64url", "..."] // optional friend prekeys
+}
+
+Response 201:
+{ "status":"ok", "server_device_id":"uuid" }
+
+3.2 Friend Token upload (after mutual save)
+POST /friends/upload
+Request:
+{
+  "device_id": "uuid",
+  "friend_token": "base64url",
+  "friend_pub_key": "base64url",
+  "encrypted_profile_blob": "base64url"
+}
+
+Response:
+{ "status":"ok" }
+
+3.3 Push Relay (server only; not exposing message plaintext)
+POST /messages/push
+Request:
+{
+  "to_device_id":"uuid",
+  "from_device_id":"uuid",
+  "ciphertext_blob":"base64url", // envelope encrypted to recipient friend key
+  "push_hint":"You have a new ShyPal message" // no plaintext
+}
+
+Response:
+{ "status":"queued" }
+
+3.4 Reports
+POST /reports
+Request:
+{
+  "reporter_device_hash":"sha256",
+  "offender_id_hash":"sha256",
+  "timestamp":"iso8601",
+  "evidence_blob":"base64url" // optional hashed metadata
+}
+
+Response: { "status":"received" }
+3.5 Health & admin endpoints (internal)
+GET /health
+
+
+GET /stats (admin auth)
+
+
+Security
+All endpoints require Authorization: Bearer <JWT> obtained by device registration. JWT contains device_id, exp, and server-signed.
+
+
+
+4 — Backend Folder & Infra Structure (docker-compose + components)
+Provide minimal infra for dev + prod patterns.
+4.1 Services (docker-compose)
+api — FastAPI / Node.js app (port 8000)
+
+
+postgres — Postgres 15
+
+
+redis — Redis for job queue
+
+
+push-relayer — worker to send APNs/FCM (connects to Firebase / Apple)
+
+
+migrations — migrator container (alembic)
+
+
+minio — S3-compatible optional storage
+
+
+traefik / nginx — reverse proxy/SSL
+
+
+docker-compose.yml (high level) includes networks: shypal-net.
+4.2 DB schema (Postgres simplified)
+Tables:
+devices (id uuid PK, platform, pub_key text, created_at)
+
+
+friend_tokens (id uuid PK, owner_device_id FK, friend_token text, friend_pub_key text, encrypted_profile_blob text, created_at)
+
+
+push_tokens (id uuid PK, device_id FK, platform, push_token text, created_at)
+
+
+reports (id uuid PK, reporter_hash text, offender_hash text, evidence text, created_at)
+
+
+Indexes on device_id and friend_token.
+4.3 Worker & queues
+Use Redis Streams or RabbitMQ to queue push tasks and abuse analytics processing.
+
+
+push-relayer consumes push_queue and sends push messages.
+
+
+4.4 Deployment
+Stages: dev, staging, prod
+
+
+CI: GitHub Actions building containers, running tests, pushing images to registry, running migrations, deploying via Terraform/CloudFormation or Kubernetes (for scale). For MVP, a single docker-compose on a VM is fine.
+
+
+
+5 — Threat Model & Mitigations (prioritized)
+5.1 Threats
+Stalker tracks user by beacon IDs — BLE beacons can be used for tracking.
+
+
+Eavesdropper intercepts handshake / messages — man-in-the-middle.
+
+
+Replay attacks — attacker resends old messages.
+
+
+Mass spamming — one actor sending many unsolicited messages.
+
+
+Backend deanonymization — storing tokens or logs that can be correlated.
+
+
+Device compromise — attacker with physical access obtains saved tokens/messages.
+
+
+Push spoofing — malicious push to user via compromised server credentials.
+
+
+5.2 Mitigations (practical)
+Rotating Ephemeral IDs (every 60s) & unlinkability by deriving ephemeral IDs from ephemeral keys. Avoid broadcasting long-term pubkeys.
+
+
+E2EE with X25519 + AES-GCM prevents eavesdropping. Optional Signal Protocol for forward secrecy.
+
+
+Include nonces and sequence numbers; use HKDF; implement replay protection (reject duplicate seq).
+
+
+Rate-limiting & one unsolicited message per discovered ephemeral ID; local block list; server-side hashed rate detection.
+
+
+Minimal server data: store only friend token + friend pubkey; never store plaintext messages; rotate logs; apply differential privacy for analytics.
+
+
+Device storage: keys in Secure Enclave / Android Keystore; store encrypted DB with hardware-backed keys.
+
+
+Push credentials security: store APNs & FCM keys in vault; strict IAM roles; sign push tasks.
+
+
+5.3 Operational controls
+Provide immediate in-app block and report workflows; local block persists across sessions.
+
+
+Legal & privacy: clear TOS and reporting process; cooperate with law enforcement only with court orders; track hashed evidence.
+
+
+
+6 — GitHub Repo Structure (recommended)
+Top-level monorepo or multiple repos? Recommend multi-repo with single umbrella organization shypal/. Provide skeleton:
+shypal/
+├─ mobile-ios/                 # iOS Swift project
+│  ├─ ShyPal.xcodeproj
+│  ├─ Modules/
+│  │  ├─ CoreCrypto/
+│  │  ├─ DiscoveryKit/
+│  │  ├─ ChatEngine/
+│  │  └─ UI/
+│  └─ README.md
+├─ mobile-android/             # Android Kotlin project
+│  ├─ app/
+│  ├─ modules/
+│  │  ├─ crypto/
+│  │  ├─ discovery/
+│  │  └─ transport/
+│  └─ README.md
+├─ backend/                    # FastAPI/Node.js service
+│  ├─ api/
+│  ├─ workers/
+│  ├─ migrations/
+│  ├─ Dockerfile
+│  └─ README.md
+├─ infra/                      # terraform / docker-compose
+│  ├─ docker-compose.yml
+│  └─ terraform/
+├─ docs/
+│  ├─ protocol.md
+│  ├─ threat_model.md
+│  └─ onboarding_texts.md
+├─ design/
+│  ├─ wireframes/
+│  └─ branding/
+└─ .github/
+   └─ workflows/               # CI/CD
+
+CI/CD
+iOS build: GitHub Actions macOS runner; TestFlight upload.
+
+
+Android build: GH Actions; Play Console internal testing.
+
+
+Backend: build & push Docker images; deploy to staging/prod.
+
+
+
+7 — Next concrete artifacts I can generate right away (pick any or say “generate all” and I’ll output them in sequence)
+Full OpenAPI YAML (complete endpoints)
+
+
+Swift/Kotlin starter skeleton for Discovery & Handshake (source files)
+
+
+docker-compose + example env files
+
+
+PlantUML sequence diagram for Discovery → Handshake → Message → Save
+
+
+README templates for each repo
+
+
+You said “do all” earlier — I delivered all design docs above. If you want I will now generate the OpenAPI YAML, the PlantUML sequence, and the Swift/Kotlin skeleton files right here. Which one do you want first? Or say “Generate all three” and I’ll paste them in order.
+Short answer up-front: There is no single “AI app” that will build ShyPal perfectly end-to-end without human engineering.
+ For a real production ShyPal (BLE + Multipeer + encrypted offline P2P + save→online flow) the best practical route is:
+Use a native-cross approach with Flutter (single codebase) + proven native plugins for BLE / Multipeer + strong AI coding assistants (Cursor + GitHub Copilot) to accelerate engineering. (Flutter Docs)
+Below I show the evidence, the concrete recommendation (tools, libs, stack), exact reasons why, a step-by-step plan you can hand to engineers or paste into an AI agent, and honest risks (so you don’t get surprised).
+
+1) Key facts & sources you should know (real research, real cites)
+iOS MultipeerConnectivity is the native framework for offline peer discovery and transfers (Wi-Fi / peer-to-peer Wi-Fi / Bluetooth) — this is the correct, supported iOS path for ShyPal’s offline P2P. (Apple Developer)
+
+
+Flutter (Dart) can access native device features via platform channels / method channels; that means you can implement BLE/Multipeer/native Wi-Fi Direct logic in platform code and call it from a single Flutter UI codebase. (Flutter Docs)
+
+
+There are maintained Flutter packages for BLE and P2P that are actively used (flutter_blue_plus, flutter_nearby_connections, nearby_service, wifi_direct_plugin, etc.) — these let you implement BLE advertising/scanning and Multipeer-like behavior in Flutter. (Examples: flutter_blue_plus, flutter_nearby_connections, nearby_service.) (Dart packages)
+
+
+AI code assistants (Cursor, GitHub Copilot) are currently the top practical tools to accelerate building production code; they significantly speed creation but still require human review and testing. (Cursor is a leading AI coding editor; GitHub Copilot integrates into IDEs and suggests code.) (Cursor)
+
+
+AI doesn’t replace careful engineering — studies and news show AI can help but also slow experienced devs and can’t guarantee bug-free production; so expect manual review, tests, and security audits. (METR/Reuters findings; also cautionary industry failures like Builder.ai highlight risk of trusting marketing alone.) (Reuters)
+
+
+(Those five are the most “load-bearing” facts for choosing the toolchain.)
+
+2) Recommended single-sentence approach (best balance of speed & capability)
+Build ShyPal in Flutter (single codebase) using native platform plugins for BLE / Multipeer / Wi-Fi Direct and use Cursor + GitHub Copilot as AI pair programmers for scaffolding, boilerplate, and iterative code generation — then run manual audits, multi-device field tests, and a crypto security review. (Flutter Docs)
+Why not “pure no-code / pure AI builder”?
+No-code builders (FlutterFlow, Adalo, Glide, Builder.ai historically) are great for UI / Firebase workflows, but they do not reliably support deep native low-level features (BLE peripheral + iOS Multipeer + custom crypto) without writing native plugins or method channels. You’ll end up writing native code anyway. (Momen)
+
+
+
+3) Concrete toolstack — what to use and exactly why
+Core app
+Framework: Flutter (Dart) — single codebase for iOS + Android; easy to export native code & integrate plugins. Use Flutter so UI dev is fast and platform-specific features are implemented once via plugins/method channels. (Flutter Docs)
+
+
+Native / platform features (plugins & native code)
+BLE: flutter_blue_plus (maintained BLE plugin; active changelog). (Dart packages)
+
+
+P2P / Multipeer on iOS: use native MultipeerConnectivity via a Flutter plugin or platform channel (nearby_service / wifi_direct_plugin indicate options). On Android, use Wi-Fi Aware / Nearby Connections / Wi-Fi Direct. (There are Flutter packages that wrap some of this: nearby_service, flutter_nearby_connections, wifi_direct_plugin.) (Dart packages)
+
+
+Low-level native hooks: implement missing features with platform channels (Flutter → Swift/Kotlin) — Flutter supports this pattern explicitly. (Flutter Docs)
+
+
+Crypto
+Libsodium / libsodium-bindings for X25519 / HKDF / AES-GCM, or libsignal (Signal Protocol) bindings if you want full Double Ratchet. Use existing, audited libraries — do not roll your own crypto. (I previously recommended libsignal; use it in Phase 2.) (flutterflow.io)
+
+
+AI developer tooling (for speed & reliability)
+Cursor — AI-first code editor and agent to help scaffold code, run refactors, and craft native plugin glue. Good for interactive code generation and multi-file edits. (Cursor)
+
+
+GitHub Copilot (IDE plugin) — in-editor suggestions, code completions, unit test scaffolding. Use in Android Studio / Xcode (VS Code + Copilot for Flutter). (GitHub)
+
+
+Static analysis & linters: dart analyze, ktlint, SwiftLint.
+
+
+CI: GitHub Actions for builds + unit tests + integration tests.
+
+
+Backend (optional for save/push)
+Backend: FastAPI (Python) or Node.js (Express/Fastify) — minimal endpoints for friend tokens and push registration; use PostgreSQL + Redis + worker for push. (This matches the plan we detailed earlier.)
+
+
+
+4) Why this combo is the best practical choice for ShyPal (evidence-backed)
+Native BLE & Multipeer are required for ShyPal. iOS has MultipeerConnectivity as the sanctioned offline P2P way — you cannot replicate that reliably with pure no-code. Use Flutter with native channels to call Multipeer on iOS directly. (Apple Developer)
+
+
+Flutter + plugins already has active packages for BLE/P2P. That saves time vs building two full native codebases from scratch while still allowing native-level control when required. (See flutter_blue_plus, nearby_service, flutter_nearby_connections.) (Dart packages)
+
+
+Cursor + Copilot speed up repetitive coding and scaffolding, but they don’t replace architecture, device testing, and security audits — you still need senior engineers to review and integrate the AI outputs safely. (See AI productivity nuance and Reuters study on mixed effects.) (Reuters)
+
+
+
+5) Hands-on, step-by-step pragmatic plan (do this to avoid failure)
+Prototype (2–4 weeks)
+
+
+Tech: Flutter minimal UI + flutter_blue_plus and nearby_service plugins.
+
+
+Goal: BLE discovery + show "Nearby bubbles" UI + send one short encrypted message over GATT.
+
+
+Use Cursor to scaffold code and Copilot for small helper functions.
+
+
+Manual tests on 3 device pairs (iPhone 12+, iPhone SE, Pixel 5+, Samsung Sxx).
+
+
+Stable Offline Chat + Crypto (4–6 weeks)
+
+
+Add ECDH handshake (libsodium) and AES-GCM message envelopes.
+
+
+Implement ephemeral rotating IDs and auto-delete session store.
+
+
+Add UI for unsolicited-message limit and accept/ignore flow.
+
+
+Write unit tests for cryptographic operations.
+
+
+iOS Multipeer polish (2–4 weeks)
+
+
+Implement MultipeerConnectivity path in Swift and call from Flutter via platform channel; test on several iOS combos.
+
+
+Use Cursor to generate platform-channel boilerplate and Copilot to complete binding code, then review manually.
+
+
+Android Wi-Fi Direct / Nearby (3–5 weeks)
+
+
+Implement Wi-Fi Aware / Nearby Connections fallback in Kotlin via plugin or platform code.
+
+
+Test across Pixel and Samsung devices; handle OEM differences.
+
+
+Mutual Save & Backend (2–4 weeks)
+
+
+Implement friend token exchange, backend endpoints, push registration.
+
+
+Security: ensure server only stores ciphertext/public prekeys; no plaintext.
+
+
+Security Audit & Field Trials (3–6 weeks)
+
+
+Hire a crypto/security audit (libsignal / handshake review).
+
+
+Run a controlled pilot on campus or event (50–200 users) and collect metrics.
+
+
+Iterate, performance tune & scale
+
+
+Battery optimization, background constraints.
+
+
+Automation for CI/CD and TestFlight/Play internal tracks.
+
+
+Note: Throughout, use Cursor + Copilot to generate and refactor code, but always require human review, automated tests, and end-to-end device testing.
+
+6) What to watch out for (real risks & how to mitigate)
+BLE / P2P is unreliable across OEMs — test on many devices (Samsung/Xiaomi often have non-standard BLE behaviors). Mitigate: broad device matrix, robust retry/backoff, and platform-specific fallbacks. (Community reports show variability in BLE plugin behavior.) (Stack Overflow)
+
+
+iOS background discovery is limited — Multipeer requires the app to be running or special entitlements; you can’t run fully stealth background discoverability. Mitigate: clear onboarding UX asking users to open the app when they want to be discoverable. (Apple Developer)
+
+
+AI hallucinations — AI assistants sometimes generate plausible-but-wrong code. Mitigate: strict code reviews, unit tests, static analysis, and security audit. (Research shows AI can slow experienced devs and needs human oversight.) (Reuters)
+
+
+Business risk from reliance on closed no-code vendors (Builder.ai cautionary example) — don’t outsource the full product to black-box vendor without code escrow and audit. (Financial Times)
+
+
+
+7) Short final recommendation (copy-paste for your team / Cursor prompt)
+If you want to feed to Cursor or hire engineers, use this prompt (copy-paste):
+Build ShyPal as a Flutter app using flutter_blue_plus for BLE core discovery and nearby_service / a Multipeer iOS platform channel for iOS P2P. Implement X25519 ECDH key exchange (libsodium) + AES-256-GCM message envelopes, rotating ephemeral IDs, and auto-delete session store. Use Cursor + GitHub Copilot to scaffold code and platform-channel glue, but require unit tests, cross-device compatibility tests (≥6 Android models + iPhone models), and an external crypto audit before beta. Backend minimal: FastAPI with PostgreSQL and Redis for friend-token registry and push relayer. Provide CI/CD with GitHub Actions and TestFlight / Play internal tracks.
+(If you want, I’ll expand that into a ready-to-run Cursor “mission” JSON or a GitHub issue board with tasks. Say “Make Cursor mission” and I’ll produce it.)
+
+8) Want me to do next — pick one (I’ll do it now in this chat)
+A) Create a Cursor mission (task list + files to generate) for building the Flutter prototype.
+
+
+B) Generate concrete starter repo skeleton (Flutter + example plugin glue + README + basic FastAPI backend).
+
+
+C) Produce exact device test matrix + test scripts for BLE / Multipeer.
+
+
+D) Produce a procurement checklist (parts: test devices, security auditor, CI runners).
+
+
+Which one now? (I’ll generate it immediately.)
+Done — I created the starter project ZIP containing everything you asked for (Cursor mission, Flutter starter skeleton + native platform-channel examples, FastAPI backend skeleton with Docker Compose & OpenAPI, device test matrix and test scripts, procurement checklist, CI stub, and threat model).
+Download it here: Download the ShyPal starter project ZIP
+Next steps I can take (pick any):
+Expand the Flutter skeleton into a runnable Flutter app with UI screens (I can generate main.dart + widgets).
+
+
+Flesh out the native platform plugin implementations (full Swift/Kotlin files integrated into sample Flutter project).
+
+
+Generate unit test stubs and crypto test vectors.
+
+
+Produce a Cursor mission JSON tailored for direct Cursor AI import (if you prefer a different format).
+
+
+Which one do you want next?
+Good — I read Bolt’s support docs and used them to craft a single, ready-to-paste “Build Now” prompt you can drop straight into Bolt AI. I included everything ShyPal needs from A→Z, plus clear engineering constraints (what Bolt can do automatically vs what requires native plugin coding / human review), test/acceptance criteria, CI, deployment, and security audit steps.
+Two quick facts from Bolt’s docs I used when writing this prompt:
+Bolt Cloud provides hosting, databases and domains you can use. (support.bolt.new)
+
+
+Bolt integrates with Expo (for mobile), Figma (design), GitHub (version control), and backends like Supabase — useful when wiring mobile + cloud. (support.bolt.new)
+
+
+
+✅ What to do now
+Copy the full prompt below (everything between the triple lines ---)
+
+
+Open your Bolt AI builder (https://bolt.new) → paste the prompt into the “Build” input (or Project Description) → press Build Now
+
+
+Bolt will scaffold the project. After Bolt finishes, you must perform the native plugin review + device testing and run the crypto audit steps listed — I explain those clearly inside the prompt.
+
+
+
+🔴 Important note before you run
+Bolt is excellent at scaffolding apps, wiring front-end flows, creating APIs, hosting, and integrating design assets (Expo / Figma / GitHub / Supabase), and it can produce a huge portion of the codebase. However, ShyPal depends on low-level native features (iOS MultipeerConnectivity, BLE advertising/peripheral behavior and secure cryptographic code) that require:
+writing native platform code (Swift / Kotlin) for plugins or platform channels,
+
+
+manual device testing across many phone models,
+
+
+and an external crypto audit (libsignal or libsodium integration).
+
+
+The prompt explicitly instructs Bolt to generate platform-channel stubs + native plugin templates and labels them REQUIRES MANUAL ENGINEERING REVIEW. Do not skip those steps.
+
+───────────────────────────────────────────────
+PASTE THIS ENTIRE PROMPT INTO BOLT AI → Build Now
+ ───────────────────────────────────────────────
+Project name: ShyPal — Offline Proximity Messaging (iOS + Android + Optional Cloud Save)
+Primary goal (one sentence)
+ Build a production-ready, offline-first, privacy-first proximity messaging app called ShyPal that lets people anonymously send a single unsolicited text to someone nearby (BLE/Wi-Fi/Multipeer), have ephemeral encrypted chats (auto-delete after 5 minutes), and — after mutual consent on long conversations — exchange a friend token to continue chatting online via encrypted push. Provide full scaffolding for mobile apps (Expo/React Native or Flutter front-end), native platform-channel plugin stubs for low-level features (iOS Multipeer + CoreBluetooth; Android BLE + Nearby/Wi-Fi Direct), and an opt-in minimal backend for friend-token sync, push relay and abuse reports. Include CI, infra (Bolt Cloud / Supabase / Docker), OpenAPI, testing plan, security checklist, and deployment instructions.
+Context & constraints (read before building)
+Platform constraints (global fact): No OS allows messaging to arbitrary phones that are only OS-discoverable — both users must run an app-level discoverable service. ShyPal’s discovery must be app-level, using BLE advertising, iOS MultipeerConnectivity, and Android Nearby/Wi-Fi Direct. (Bolt can scaffold, but native platform-channel code + device testing are required.)
+
+
+Security: All messages must be end-to-end encrypted. Use X25519 (Curve25519) for key exchange and AES-256-GCM for message encryption. Prefer libsignal / Double-Ratchet as Phase-2 upgrade.
+
+
+Privacy model: No phone numbers, no persistent ID broadcast, rotating ephemeral IDs (rotate every 60s), session auto-delete (5 minutes inactivity default), one unsolicited message limit. Mutual save requires both parties to confirm.
+
+
+References Bolt should use while building
+Bolt docs: support features & integrations (Bolt Cloud hosting, DBs, Expo integration, Figma & GitHub support). Use Bolt Cloud hosting / DB features if available. (support.bolt.new)
+
+
+High-level deliverables (what to output)
+Two mobile apps (iOS + Android) built from a single codebase:
+
+
+Option A (preferred for Bolt/Expo): Expo React Native project with native plugin stubs for low-level features.
+
+
+Option B (if Bolt supports Flutter well): Flutter project with platform channels.
+
+
+Include UI screens, flows, and local encrypted data store.
+
+
+Native plugin stubs and example implementations (labeled manual engineer review required):
+
+
+iOS Swift module for MultipeerConnectivity & CoreBluetooth (advertise & browse + GATT assist).
+
+
+Android Kotlin module for BLE Advertising/Scanning, Nearby Connections / Wi-Fi Direct (advertise & discovery).
+
+
+Each plugin must expose simple method-channel APIs: startAdvertising, stopAdvertising, startDiscovery, stopDiscovery, sendPayload, onPayloadReceived (event stream).
+
+
+Cryptography module:
+
+
+X25519 keygen & ECDH helper (libsodium or libsodium bindings).
+
+
+AES-256-GCM envelope helpers, nonce management, HKDF derivation.
+
+
+Tests (unit test vectors) for handshake and encryption.
+
+
+Protocol spec file (RFC-style) inside repo: exact ephemeral beacon format, IntroRequest/IntroReply, EncryptedMessage envelope, SaveOffer/SaveConfirm flow. (Use CBOR/binary recommended.)
+
+
+Backend skeleton (optional but required for online continuation & push):
+
+
+Minimal API: /devices/register, /friends/upload, /messages/push, /reports.
+
+
+Docker Compose for local dev (FastAPI or Node.js), Postgres, Redis; sample OpenAPI spec.
+
+
+CI / CD:
+
+
+GitHub Actions stubs to build mobile and backend, run linters and unit tests, and upload iOS to TestFlight + Android to Play Internal (stubs).
+
+
+Design + Assets:
+
+
+Import Figma file (supply placeholder or instruct Bolt to create basic soft pastel UI). Provide SVG icon templates and app store icon.
+
+
+Documentation:
+
+
+README with run instructions for developers and QA.
+
+
+Threat model & security checklist and list of required manual steps (native plugin completion, field testing, crypto audit).
+
+
+Testing plans & device matrix:
+
+
+Test scripts and matrix for iOS/Android models (iPhone 12/14/SE; Pixel 7; Samsung S23; Xiaomi).
+
+
+Launch plan & growth brief (campus + café + events) and privacy legal checklist (trademarks, App Store privacy labels).
+
+
+Build instructions for Bolt (very explicit)
+Create a monorepo with the following structure:
+
+ shypal/
+  mobile/
+    app/                # Expo React Native or Flutter app
+    native_plugins/
+      ios_multipeer/    # Swift plugin skeleton
+      android_nearby/   # Kotlin plugin skeleton
+  backend/
+    api/                # FastAPI/Node.js skeleton
+    docker-compose.yml
+  docs/
+    protocol.md
+    threat_model.md
+    onboarding_texts.md
+    device_test_matrix.md
+  infra/
+    terraform/ (optional)
+  design/
+    figma_import.json (or generate placeholder Figma)
+  ci/
+    .github/workflows/ci.yml
+
+
+For mobile/app: scaffold with Expo+React Native (preferred for Bolt/Expo integrations). Create navigation and the following screens: Onboarding, Discover (bubble list), Chat (ephemeral), Save Prompt, Saved Friends, Settings.
+
+
+For platform-native features:
+
+
+In native_plugins/ios_multipeer, generate a Swift plugin template that compiles and exposes the method channel interface. Implement stub methods that throw NotImplemented but include detailed comments and example code for MultipeerConnectivity usage and GATT read for full discovery payload retrieval. Mark these tasks as REQUIRES_ENGINEER_ACTION.
+
+
+In native_plugins/android_nearby, generate a Kotlin plugin template exposing the same method channel API. Implement stub methods and include Nearby Connections / Wi-Fi Direct pseudo-code & references. Mark REQUIRES_ENGINEER_ACTION.
+
+
+For cryptography:
+
+
+Add a crypto/ module in mobile that uses an existing, well-reviewed library (libsodium or tweetnacl) via native bindings. Provide JS wrappers to call native libs. Provide unit tests (including standardized test vectors).
+
+
+Implement ephemeral ID rotation scheduler (default 60s) and TTL purge (default 5 minutes).
+
+
+For offline messaging flow:
+
+
+Discovery: app scans for ephemeral beacons and fetches full ephemeral data via GATT or Multipeer service discovery when needed.
+
+
+IntroRequest/IntroReply: send via GATT or Nearby ephemeral channel; the intro reply must include recipient ephemeral pubkey.
+
+
+Handshake: derive session key using ECDH with ephemeral keys. Provide AES-GCM encrypt/decrypt helpers and message envelope format. Provide sequence number and replay prevention.
+
+
+For Save flow:
+
+
+Implement SaveOffer & SaveConfirm envelopes that exchange friend public keys and optional encrypted profile blob (emoji + nickname).
+
+
+If both confirm, generate friend_token (HMAC over shared friend key) and save to local encrypted DB. Provide backend upload endpoint to register friend public prekeys for push.
+
+
+For backend:
+
+
+Scaffold FastAPI app with endpoints described, minimal DB models, and Docker Compose. Ensure endpoints accept ciphertext-only payloads and validate JWT or API key (for device).
+
+
+UI/UX microcopy:
+
+
+Use the provided microcopy from this request for onboarding, save prompts, safety notices, and push hints.
+
+
+Test & QA scaffolding:
+
+
+Provide automated test scripts to simulate discovery/handshake/encryption on Node (unit tests) and instructions to run manual device tests (matrix).
+
+
+CI & Deploy:
+
+
+Add GitHub Actions that run yarn test / flutter analyze or flutter doctor, build artifacts, and publish to TestFlight/Play internal (stubs — require secrets).
+
+
+Acceptance criteria (what must be true before considering Bolt’s build “ready”)
+The repository compiles locally for mobile (the front-end loads in Expo with UI and navigation).
+
+
+The method-channel plugins compile for iOS and Android (even if core native logic placeholders return NotImplemented), and documentation clearly marks the native functions requiring implementation.
+
+
+Crypto module has unit tests with passing test vectors for ECDH and AES-GCM.
+
+
+Backend runs via Docker Compose and endpoints respond with expected JSON.
+
+
+Documentation includes a step-by-step “Engineer TODO” list for native plugin completion, device test checklist, and a recommended list of devices and security auditors.
+
+
+UI mockups included in Figma (placeholder) or generated assets exist.
+
+
+A Threat Model & Security Checklist is included in docs/threat_model.md.
+
+
+A launch plan and legal items (trademark reminder, privacy policy template) are in the repo.
+
+
+Explicit manual engineering steps (must be done by human engineers after Bolt scaffolds)
+Implement the iOS MultipeerConnectivity plugin fully (accept/reject invite UI, full GATT reads, background behavior handling).
+
+
+Implement Android Nearby / Wi-Fi Direct plugin fully and reconcile OEM differences in BLE scanning/advertising.
+
+
+Integrate a production-grade cryptography library (libsodium/libsignal) natively and perform a third-party crypto audit.
+
+
+Perform wide device testing (the device matrix in docs) and tune power/duty-cycle and discovery timing.
+
+
+Validate App Store & Play Store privacy labels and review App Store submission guidelines for background Bluetooth/network usage.
+
+
+UX & Growth: include a short plan file docs/growth.md with campus / café / event rollouts, QR table cards for venues, ambassador program, and KPIs to track (Say-Hi conversion, accept rate, save conversion, retention).
+Security & compliance: include docs/privacy_policy_template.md and docs/tos_template.md and a field security audit checklist referencing Signal/libsignal audit best practices.
+Bolt-specific suggestions (how to use Bolt features)
+Use Bolt Cloud for the optional hosted DB and hosting to speed deployment. Bolt docs show Bolt Cloud provides hosting & databases that integrate with the builder. (support.bolt.new)
+
+
+Use Expo or the Bolt mobile template if Bolt supports Expo for mobile builds; Figma import can be used for design assets; attach the GitHub repo to Bolt for CI/CD. (support.bolt.new)
+
+
+Operational & legal checklist to commit in repo
+Trademark check & registration plan for “ShyPal” (file in docs/legal/).
+
+
+App Store privacy labels & permission rationale strings prepared for iOS.
+
+
+Data retention policy that states ephemeral default, optional save only with mutual consent.
+
+
+Plan for cooperating with law enforcement that preserves user privacy and requires court orders.
+
+
+Security / QA / Audit plan (deliverable)
+Add a SECURITY.md that instructs to run:
+
+
+Unit tests for crypto module with known test vectors
+
+
+Integration tests for session establishment and message round-trips
+
+
+Fuzz tests for handshake inputs
+
+
+Third-party crypto audit (libsignal or equivalent)
+
+
+Penetration test for backend endpoints and push relay
+
+
+Deliver to me in output: after pressing Build, have Bolt:
+Commit the repo to a new GitHub repo shypal/builder-output (private by default).
+
+
+Provide a short build report listing what was generated automatically and a TODO list of native items requiring manual engineers.
+
+
+Provide a ZIP download of the generated repo and a single-page “handoff” PDF (engineer tasks + testing matrix + audit vendor suggestions).
+
+
+Final admonition to Bolt Builder (copy to its instructions)
+This is a sensitive privacy-first app. DO NOT implement any feature that leaks phone numbers, GPS locations, or persistent identifiers without explicit opt-in. All server-side storage must be ciphertext-only and limited to friend-token public prekeys and push routing metadata. Any code generated for BLE/Multipeer should be marked with REQUIRES_ENGINEER_ACTION where native implementation & thorough testing is mandatory.
+--- end of prompt ---
+After you press Build
+I will immediately:
+review Bolt’s output (code & repo) if you paste a link here, and
+
+
+run a quick checklist to confirm the scaffold meets the Acceptance Criteria above, and list any critical manual tasks Bolt didn’t complete.
+
+
+Would you like me to review Bolt’s generated repo immediately after you build and paste the GitHub link here?
+Good — I read Bolt’s support docs and used them to craft a single, ready-to-paste “Build Now” prompt you can drop straight into Bolt AI. I included everything ShyPal needs from A→Z, plus clear engineering constraints (what Bolt can do automatically vs what requires native plugin coding / human review), test/acceptance criteria, CI, deployment, and security audit steps.
+Two quick facts from Bolt’s docs I used when writing this prompt:
+Bolt Cloud provides hosting, databases and domains you can use. (support.bolt.new)
+
+
+Bolt integrates with Expo (for mobile), Figma (design), GitHub (version control), and backends like Supabase — useful when wiring mobile + cloud. (support.bolt.new)
+
+
+
+✅ What to do now
+Copy the full prompt below (everything between the triple lines ---)
+
+
+Open your Bolt AI builder (https://bolt.new) → paste the prompt into the “Build” input (or Project Description) → press Build Now
+
+
+Bolt will scaffold the project. After Bolt finishes, you must perform the native plugin review + device testing and run the crypto audit steps listed — I explain those clearly inside the prompt.
+
+
+
+🔴 Important note before you run
+Bolt is excellent at scaffolding apps, wiring front-end flows, creating APIs, hosting, and integrating design assets (Expo / Figma / GitHub / Supabase), and it can produce a huge portion of the codebase. However, ShyPal depends on low-level native features (iOS MultipeerConnectivity, BLE advertising/peripheral behavior and secure cryptographic code) that require:
+writing native platform code (Swift / Kotlin) for plugins or platform channels,
+
+
+manual device testing across many phone models,
+
+
+and an external crypto audit (libsignal or libsodium integration).
+
+
+The prompt explicitly instructs Bolt to generate platform-channel stubs + native plugin templates and labels them REQUIRES MANUAL ENGINEERING REVIEW. Do not skip those steps.
+
+───────────────────────────────────────────────
+PASTE THIS ENTIRE PROMPT INTO BOLT AI → Build Now
+ ───────────────────────────────────────────────
+Project name: ShyPal — Offline Proximity Messaging (iOS + Android + Optional Cloud Save)
+Primary goal (one sentence)
+ Build a production-ready, offline-first, privacy-first proximity messaging app called ShyPal that lets people anonymously send a single unsolicited text to someone nearby (BLE/Wi-Fi/Multipeer), have ephemeral encrypted chats (auto-delete after 5 minutes), and — after mutual consent on long conversations — exchange a friend token to continue chatting online via encrypted push. Provide full scaffolding for mobile apps (Expo/React Native or Flutter front-end), native platform-channel plugin stubs for low-level features (iOS Multipeer + CoreBluetooth; Android BLE + Nearby/Wi-Fi Direct), and an opt-in minimal backend for friend-token sync, push relay and abuse reports. Include CI, infra (Bolt Cloud / Supabase / Docker), OpenAPI, testing plan, security checklist, and deployment instructions.
+Context & constraints (read before building)
+Platform constraints (global fact): No OS allows messaging to arbitrary phones that are only OS-discoverable — both users must run an app-level discoverable service. ShyPal’s discovery must be app-level, using BLE advertising, iOS MultipeerConnectivity, and Android Nearby/Wi-Fi Direct. (Bolt can scaffold, but native platform-channel code + device testing are required.)
+
+
+Security: All messages must be end-to-end encrypted. Use X25519 (Curve25519) for key exchange and AES-256-GCM for message encryption. Prefer libsignal / Double-Ratchet as Phase-2 upgrade.
+
+
+Privacy model: No phone numbers, no persistent ID broadcast, rotating ephemeral IDs (rotate every 60s), session auto-delete (5 minutes inactivity default), one unsolicited message limit. Mutual save requires both parties to confirm.
+
+
+References Bolt should use while building
+Bolt docs: support features & integrations (Bolt Cloud hosting, DBs, Expo integration, Figma & GitHub support). Use Bolt Cloud hosting / DB features if available. (support.bolt.new)
+
+
+High-level deliverables (what to output)
+Two mobile apps (iOS + Android) built from a single codebase:
+
+
+Option A (preferred for Bolt/Expo): Expo React Native project with native plugin stubs for low-level features.
+
+
+Option B (if Bolt supports Flutter well): Flutter project with platform channels.
+
+
+Include UI screens, flows, and local encrypted data store.
+
+
+Native plugin stubs and example implementations (labeled manual engineer review required):
+
+
+iOS Swift module for MultipeerConnectivity & CoreBluetooth (advertise & browse + GATT assist).
+
+
+Android Kotlin module for BLE Advertising/Scanning, Nearby Connections / Wi-Fi Direct (advertise & discovery).
+
+
+Each plugin must expose simple method-channel APIs: startAdvertising, stopAdvertising, startDiscovery, stopDiscovery, sendPayload, onPayloadReceived (event stream).
+
+
+Cryptography module:
+
+
+X25519 keygen & ECDH helper (libsodium or libsodium bindings).
+
+
+AES-256-GCM envelope helpers, nonce management, HKDF derivation.
+
+
+Tests (unit test vectors) for handshake and encryption.
+
+
+Protocol spec file (RFC-style) inside repo: exact ephemeral beacon format, IntroRequest/IntroReply, EncryptedMessage envelope, SaveOffer/SaveConfirm flow. (Use CBOR/binary recommended.)
+
+
+Backend skeleton (optional but required for online continuation & push):
+
+
+Minimal API: /devices/register, /friends/upload, /messages/push, /reports.
+
+
+Docker Compose for local dev (FastAPI or Node.js), Postgres, Redis; sample OpenAPI spec.
+
+
+CI / CD:
+
+
+GitHub Actions stubs to build mobile and backend, run linters and unit tests, and upload iOS to TestFlight + Android to Play Internal (stubs).
+
+
+Design + Assets:
+
+
+Import Figma file (supply placeholder or instruct Bolt to create basic soft pastel UI). Provide SVG icon templates and app store icon.
+
+
+Documentation:
+
+
+README with run instructions for developers and QA.
+
+
+Threat model & security checklist and list of required manual steps (native plugin completion, field testing, crypto audit).
+
+
+Testing plans & device matrix:
+
+
+Test scripts and matrix for iOS/Android models (iPhone 12/14/SE; Pixel 7; Samsung S23; Xiaomi).
+
+
+Launch plan & growth brief (campus + café + events) and privacy legal checklist (trademarks, App Store privacy labels).
+
+
+Build instructions for Bolt (very explicit)
+Create a monorepo with the following structure:
+
+ shypal/
+  mobile/
+    app/                # Expo React Native or Flutter app
+    native_plugins/
+      ios_multipeer/    # Swift plugin skeleton
+      android_nearby/   # Kotlin plugin skeleton
+  backend/
+    api/                # FastAPI/Node.js skeleton
+    docker-compose.yml
+  docs/
+    protocol.md
+    threat_model.md
+    onboarding_texts.md
+    device_test_matrix.md
+  infra/
+    terraform/ (optional)
+  design/
+    figma_import.json (or generate placeholder Figma)
+  ci/
+    .github/workflows/ci.yml
+
+
+For mobile/app: scaffold with Expo+React Native (preferred for Bolt/Expo integrations). Create navigation and the following screens: Onboarding, Discover (bubble list), Chat (ephemeral), Save Prompt, Saved Friends, Settings.
+
+
+For platform-native features:
+
+
+In native_plugins/ios_multipeer, generate a Swift plugin template that compiles and exposes the method channel interface. Implement stub methods that throw NotImplemented but include detailed comments and example code for MultipeerConnectivity usage and GATT read for full discovery payload retrieval. Mark these tasks as REQUIRES_ENGINEER_ACTION.
+
+
+In native_plugins/android_nearby, generate a Kotlin plugin template exposing the same method channel API. Implement stub methods and include Nearby Connections / Wi-Fi Direct pseudo-code & references. Mark REQUIRES_ENGINEER_ACTION.
+
+
+For cryptography:
+
+
+Add a crypto/ module in mobile that uses an existing, well-reviewed library (libsodium or tweetnacl) via native bindings. Provide JS wrappers to call native libs. Provide unit tests (including standardized test vectors).
+
+
+Implement ephemeral ID rotation scheduler (default 60s) and TTL purge (default 5 minutes).
+
+
+For offline messaging flow:
+
+
+Discovery: app scans for ephemeral beacons and fetches full ephemeral data via GATT or Multipeer service discovery when needed.
+
+
+IntroRequest/IntroReply: send via GATT or Nearby ephemeral channel; the intro reply must include recipient ephemeral pubkey.
+
+
+Handshake: derive session key using ECDH with ephemeral keys. Provide AES-GCM encrypt/decrypt helpers and message envelope format. Provide sequence number and replay prevention.
+
+
+For Save flow:
+
+
+Implement SaveOffer & SaveConfirm envelopes that exchange friend public keys and optional encrypted profile blob (emoji + nickname).
+
+
+If both confirm, generate friend_token (HMAC over shared friend key) and save to local encrypted DB. Provide backend upload endpoint to register friend public prekeys for push.
+
+
+For backend:
+
+
+Scaffold FastAPI app with endpoints described, minimal DB models, and Docker Compose. Ensure endpoints accept ciphertext-only payloads and validate JWT or API key (for device).
+
+
+UI/UX microcopy:
+
+
+Use the provided microcopy from this request for onboarding, save prompts, safety notices, and push hints.
+
+
+Test & QA scaffolding:
+
+
+Provide automated test scripts to simulate discovery/handshake/encryption on Node (unit tests) and instructions to run manual device tests (matrix).
+
+
+CI & Deploy:
+
+
+Add GitHub Actions that run yarn test / flutter analyze or flutter doctor, build artifacts, and publish to TestFlight/Play internal (stubs — require secrets).
+
+
+Acceptance criteria (what must be true before considering Bolt’s build “ready”)
+The repository compiles locally for mobile (the front-end loads in Expo with UI and navigation).
+
+
+The method-channel plugins compile for iOS and Android (even if core native logic placeholders return NotImplemented), and documentation clearly marks the native functions requiring implementation.
+
+
+Crypto module has unit tests with passing test vectors for ECDH and AES-GCM.
+
+
+Backend runs via Docker Compose and endpoints respond with expected JSON.
+
+
+Documentation includes a step-by-step “Engineer TODO” list for native plugin completion, device test checklist, and a recommended list of devices and security auditors.
+
+
+UI mockups included in Figma (placeholder) or generated assets exist.
+
+
+A Threat Model & Security Checklist is included in docs/threat_model.md.
+
+
+A launch plan and legal items (trademark reminder, privacy policy template) are in the repo.
+
+
+Explicit manual engineering steps (must be done by human engineers after Bolt scaffolds)
+Implement the iOS MultipeerConnectivity plugin fully (accept/reject invite UI, full GATT reads, background behavior handling).
+
+
+Implement Android Nearby / Wi-Fi Direct plugin fully and reconcile OEM differences in BLE scanning/advertising.
+
+
+Integrate a production-grade cryptography library (libsodium/libsignal) natively and perform a third-party crypto audit.
+
+
+Perform wide device testing (the device matrix in docs) and tune power/duty-cycle and discovery timing.
+
+
+Validate App Store & Play Store privacy labels and review App Store submission guidelines for background Bluetooth/network usage.
+
+
+UX & Growth: include a short plan file docs/growth.md with campus / café / event rollouts, QR table cards for venues, ambassador program, and KPIs to track (Say-Hi conversion, accept rate, save conversion, retention).
+Security & compliance: include docs/privacy_policy_template.md and docs/tos_template.md and a field security audit checklist referencing Signal/libsignal audit best practices.
+Bolt-specific suggestions (how to use Bolt features)
+Use Bolt Cloud for the optional hosted DB and hosting to speed deployment. Bolt docs show Bolt Cloud provides hosting & databases that integrate with the builder. (support.bolt.new)
+
+
+Use Expo or the Bolt mobile template if Bolt supports Expo for mobile builds; Figma import can be used for design assets; attach the GitHub repo to Bolt for CI/CD. (support.bolt.new)
+
+
+Operational & legal checklist to commit in repo
+Trademark check & registration plan for “ShyPal” (file in docs/legal/).
+
+
+App Store privacy labels & permission rationale strings prepared for iOS.
+
+
+Data retention policy that states ephemeral default, optional save only with mutual consent.
+
+
+Plan for cooperating with law enforcement that preserves user privacy and requires court orders.
+
+
+Security / QA / Audit plan (deliverable)
+Add a SECURITY.md that instructs to run:
+
+
+Unit tests for crypto module with known test vectors
+
+
+Integration tests for session establishment and message round-trips
+
+
+Fuzz tests for handshake inputs
+
+
+Third-party crypto audit (libsignal or equivalent)
+
+
+Penetration test for backend endpoints and push relay
+
+
+Deliver to me in output: after pressing Build, have Bolt:
+Commit the repo to a new GitHub repo shypal/builder-output (private by default).
+
+
+Provide a short build report listing what was generated automatically and a TODO list of native items requiring manual engineers.
+
+
+Provide a ZIP download of the generated repo and a single-page “handoff” PDF (engineer tasks + testing matrix + audit vendor suggestions).
+
+
+Final admonition to Bolt Builder (copy to its instructions)
+This is a sensitive privacy-first app. DO NOT implement any feature that leaks phone numbers, GPS locations, or persistent identifiers without explicit opt-in. All server-side storage must be ciphertext-only and limited to friend-token public prekeys and push routing metadata. Any code generated for BLE/Multipeer should be marked with REQUIRES_ENGINEER_ACTION where native implementation & thorough testing is mandatory.
+--- end of prompt ---
+After you press Build
+I will immediately:
+review Bolt’s output (code & repo) if you paste a link here, and
+
+
+run a quick checklist to confirm the scaffold meets the Acceptance Criteria above, and list any critical manual tasks Bolt didn’t complete.
+
+
+Would you like me to review Bolt’s generated repo immediately after you build and paste the GitHub link here?
+Here is a high-power, advanced Bolt command designed for maximum accuracy, step-by-step adherence, and full build automation.
+ Paste this exactly into Bolt along with the ZIP.
+
+✅ ADVANCED BOLT COMMAND FOR SHYPAL (PHASE 1 BUILD)
+(Paste EXACTLY as written after attaching the ZIP)
+You are upgrading the attached ShyPal Phase 1 foundation ZIP into a complete, runnable Expo React Native prototype.
+ Follow every step in exact order.
+
+🔶 PROJECT GOAL
+Produce a fully runnable ShyPal Phase 1 prototype that includes:
+Expo React Native mobile app
+
+
+Simulated offline discovery
+
+
+E2EE placeholder crypto (tweetnacl)
+
+
+Anonymous chat
+
+
+Ephemeral session IDs
+
+
+Auto-delete after 5 minutes
+
+
+Save-friend prompt after long chats
+
+
+Clean UI (Discover → Chat → Saved Friends)
+
+
+Backend placeholder is optional (no networking required)
+
+
+All native radio features must remain simulated.
+This Phase 1 prototype should be stable, typed, modular, and readable — ready for native engineers to implement BLE / Wi-Fi Direct / Multipeer Connectivity in Phase 2.
+
+🔵 INSTRUCTIONS FOR BOLT — FOLLOW ALL STEPS EXACTLY
+STEP 1 — Import the ZIP
+Import the entire ZIP as the project root.
+ Preserve all folder structures, including:
+mobile-expo/
+backend/
+docs/
+.github/
+docker/
+protocol/
+
+Do NOT rename folders.
+
+STEP 2 — Analyze the Architecture
+Read and fully understand:
+docs/protocol.md
+
+
+docs/engineer_handoff.md
+
+
+docs/threat_model.md
+
+
+docs/device_test_matrix.md
+
+
+All placeholder TypeScript service interfaces
+
+
+Do not modify documented architecture unless absolutely required.
+
+STEP 3 — Implement FULL Expo App (Phase 1 Functional)
+3.1 Core Features
+Build the following features exactly:
+Discover Screen
+Simulated list of nearby devices
+
+
+Auto-refreshing
+
+
+Uses SimulatedDiscoveryService from ZIP
+
+
+Each device shows
+
+
+rotating ephemeral ID
+
+
+signal strength (fake)
+
+
+"Message" button
+
+
+Chat Screen
+E2EE placeholder encryption (tweetnacl)
+
+
+Send + receive messages
+
+
+Messages auto-expire after 5 minutes
+
+
+No logs, no history
+
+
+In-memory only
+
+
+On close: wipe state instantly
+
+
+Show “Chat secure, local-only” label
+
+
+Save Friend Prompt
+Trigger when any of the following is true:
+Chat duration ≥ X minutes (from protocol.md)
+
+
+Message count ≥ Y
+
+
+User manually taps menu → Save
+
+
+Save friend object into local storage (AsyncStorage).
+ Expose a "Saved Friends" screen.
+3.2 UI Requirements
+Follow these UI rules:
+React Navigation (stack + tabs)
+
+
+Clean, minimal UI
+
+
+Dark/light mode support
+
+
+Responsive
+
+
+No external UI kits unless already used
+
+
+
+STEP 4 — Implement TypeScript Layer (Complete)
+Implement the following modules fully in TypeScript:
+/src/services/crypto.ts
+/src/services/session_manager.ts
+/src/services/simulated_discovery.ts
+/src/services/storage.ts
+/src/services/message_ttl.ts
+/src/hooks/useNearbyDevices.ts
+/src/hooks/useChatSession.ts
+
+All must be complete and tested in Expo.
+
+STEP 5 — Native Interfaces (DO NOT IMPLEMENT)
+Respect the rule:
+Do NOT implement native Bluetooth/Wi-Fi/Multipeer code.
+Instead:
+Keep all TypeScript interface shells in:
+
+ src/native_interfaces/
+
+
+Add TODO comments for native engineers
+
+
+Ensure Expo can compile without native code
+
+
+
+STEP 6 — Stability, Cleanup, CI
+Fix all TypeScript errors
+
+
+Remove unused imports
+
+
+Ensure clean file structure
+
+
+Ensure npm start runs Expo with no warnings
+
+
+Final output must build on:
+
+
+iOS Simulator
+
+
+Android Emulator
+
+
+
+STEP 7 — Produce Deliverables
+7.1 Output must include
+Complete Expo project
+
+
+All implemented screens
+
+
+All TS logic completed
+
+
+All docs intact
+
+
+No placeholder files missing
+
+
+7.2 Format of Output
+Return the results as:
+A ZIP of the final project
+
+
+Plus a summary of:
+
+
+created files
+
+
+modified files
+
+
+instructions to run the app
+
+
+
+FINAL BOLT STATEMENT
+Build the ShyPal Phase 1 prototype exactly according to these instructions.
+ Do not skip steps.
+ Do not rewrite architecture.
+ Return the final Expo project.
+
+If you want, I can also generate:
+✅ A Bolt follow-up command (for Phase 2 native integrations)
+ or
+ ✅ A Cursor mission JSON that automatically orchestrates this entire build
+Just tell me “Make Phase 2 Bolt command” or “Generate Cursor mission JSON”.
+
