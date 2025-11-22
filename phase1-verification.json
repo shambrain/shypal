@@ -1,0 +1,163 @@
+{
+  "status": "FAIL",
+  "timestamp": "2025-11-22T08:27:55.447152Z",
+  "checks": [
+    {
+      "id": "repo_structure",
+      "desc": "Repo contains mobile/, backend/, docs/, mobile/__tests__",
+      "status": "PASS",
+      "details": {
+        "mobile": true,
+        "backend": true,
+        "docs": true,
+        "mobile_tests": true
+      }
+    },
+    {
+      "id": "mobile_package_json",
+      "desc": "mobile/package.json exists and contains typecheck/test scripts and required deps",
+      "status": "PASS",
+      "details": {
+        "scripts": [
+          "start",
+          "android",
+          "ios",
+          "web",
+          "test",
+          "typecheck"
+        ],
+        "has_typecheck": true,
+        "has_test": true,
+        "missing_deps": []
+      }
+    },
+    {
+      "id": "tsconfig",
+      "desc": "TypeScript config present",
+      "status": "FAIL",
+      "details": {
+        "tsconfig_mobile": false,
+        "tsconfig_root": false
+      }
+    },
+    {
+      "id": "unit_tests_presence",
+      "desc": "Deterministic unit tests presence",
+      "status": "PASS",
+      "details": {
+        "mobile/__tests__/crypto.test.ts": true,
+        "mobile/__tests__/message_ttl.test.ts": true,
+        "mobile/__tests__/simulated_discovery.test.ts": true
+      }
+    },
+    {
+      "id": "simulated_discovery",
+      "desc": "simulated_discovery.ts exists",
+      "status": "PASS",
+      "details": {
+        "path": "mobile/src/services/simulated_discovery.ts",
+        "exists": true
+      }
+    },
+    {
+      "id": "message_ttl",
+      "desc": "message_ttl.ts exists",
+      "status": "PASS",
+      "details": {
+        "path": "mobile/src/services/message_ttl.ts",
+        "exists": true
+      }
+    },
+    {
+      "id": "storage",
+      "desc": "storage.ts exists (AsyncStorage + InMemory)",
+      "status": "PASS",
+      "details": {
+        "path": "mobile/src/services/storage.ts",
+        "exists": true
+      }
+    },
+    {
+      "id": "crypto_placeholder",
+      "desc": "crypto.ts placeholder exists",
+      "status": "PASS",
+      "details": {
+        "path": "mobile/src/services/crypto.ts",
+        "exists": true
+      }
+    },
+    {
+      "id": "backend_syntax",
+      "desc": "backend main.py exists and is syntactically valid Python",
+      "status": "PASS",
+      "details": {
+        "path": "backend/main.py",
+        "exists": true,
+        "syntax_ok": true,
+        "error": null
+      }
+    },
+    {
+      "id": "docs_presence",
+      "desc": "Required docs present",
+      "status": "PASS",
+      "details": {
+        "docs/protocol.md": true,
+        "docs/threat_model.md": true,
+        "docs/engineer_handoff.md": true,
+        "docs/device_test_matrix.md": true
+      }
+    },
+    {
+      "id": "ci_workflow",
+      "desc": "GitHub Actions CI workflow present",
+      "status": "PASS",
+      "details": {
+        "path": ".github/workflows/ci.yml",
+        "exists": true
+      }
+    },
+    {
+      "id": "screens_presence",
+      "desc": "Required screens present",
+      "status": "PASS",
+      "details": {
+        "mobile/src/screens/Onboarding.tsx": true,
+        "mobile/src/screens/Discover.tsx": true,
+        "mobile/src/screens/Chat.tsx": true,
+        "mobile/src/screens/SavedFriends.tsx": true
+      }
+    },
+    {
+      "id": "expo_config",
+      "desc": "Expo config present in mobile/",
+      "status": "FAIL",
+      "details": {
+        "mobile_app_json": false,
+        "root_app_json": false
+      }
+    }
+  ],
+  "runtime_checks": {
+    "npm_install": {
+      "status": "SKIPPED",
+      "reason": "Cannot run npm install in this environment; run locally or CI"
+    },
+    "typecheck": {
+      "status": "SKIPPED",
+      "reason": "Cannot run tsc without node toolchain here"
+    },
+    "jest_tests": {
+      "status": "SKIPPED",
+      "reason": "Cannot run jest in this environment"
+    },
+    "expo_start": {
+      "status": "SKIPPED",
+      "reason": "Cannot start Metro dev server in this environment"
+    },
+    "backend_docker_compose": {
+      "status": "SKIPPED",
+      "reason": "Cannot run docker-compose in this environment"
+    }
+  }
+}
